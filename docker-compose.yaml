@@ -1,0 +1,90 @@
+version: '3.8'
+
+services:
+  execution-service:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    container_name: execution-service
+    ports:
+      - "8082:8080"
+    environment:
+      - SPRING_PROFILES_ACTIVE=local
+      - DB_URL=jdbc:postgresql://execution-db:5432/execution_service_db
+      - DB_USERNAME=execution_service_user
+      - DB_PASSWORD=execution_service_password
+      - AWS_REGION=us-east-1
+      - AWS_SQS_ENDPOINT=http://localstack:4566
+      - AWS_ACCESS_KEY=test
+      - AWS_SECRET_KEY=test
+      - SQS_EXECUTION_EVENTS_QUEUE_URL=http://localstack:4566/000000000000/execution-service-events.fifo
+      - SQS_EXECUTION_COMPLETED_QUEUE_URL=http://localstack:4566/000000000000/execution-completed-queue
+      - SQS_RESOURCE_UNAVAILABLE_QUEUE_URL=http://localstack:4566/000000000000/resource-unavailable-queue
+      - SQS_BILLING_EVENTS_QUEUE=http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/billing-events.fifo
+      - SQS_OS_EVENTS_QUEUE=http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/os-order-events-queue.fifo
+    depends_on:
+      execution-db:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    networks:
+      - execution-network
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/api/execution-service/actuator/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  execution-db:
+    image: postgres:16-alpine
+    container_name: execution-db
+    ports:
+      - "5434:5432"
+    environment:
+      - POSTGRES_DB=execution_service_db
+      - POSTGRES_USER=execution_service_user
+      - POSTGRES_PASSWORD=execution_service_password
+    volumes:
+      - execution-db-data:/var/lib/postgresql/data
+      - ./database/init-scripts:/docker-entrypoint-initdb.d
+    networks:
+      - execution-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U execution_service_user -d execution_service_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  localstack:
+    image: localstack/localstack:3.4
+    container_name: execution-localstack
+    ports:
+      - "4568:4566"
+      - "4610-4659:4510-4559"
+    environment:
+      - SERVICES=sqs
+      - DEBUG=1
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      - AWS_DEFAULT_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+    volumes:
+      - localstack-data:/var/lib/localstack
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./localstack/init-aws.sh:/etc/localstack/init/ready.d/init-aws.sh
+    networks:
+      - execution-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+networks:
+  execution-network:
+    driver: bridge
+
+volumes:
+  execution-db-data:
+  localstack-data:

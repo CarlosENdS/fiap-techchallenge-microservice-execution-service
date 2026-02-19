@@ -1,0 +1,266 @@
+name: CD Pipeline
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+
+env:
+  JAVA_VERSION: '21'
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: cargarage-execution-service
+  EKS_CLUSTER_NAME: cargarage-eks-prod
+  TF_CLOUD_ORGANIZATION: fiap-soat-techchallenge
+  TF_WORKSPACE: fiap-techchallenge-infra-database
+
+jobs:
+  build-and-push:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    outputs:
+      image-tag: ${{ steps.version.outputs.version }}
+      image-uri: ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.version.outputs.version }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Extract version from POM
+        id: version
+        working-directory: ./app
+        run: |
+          VERSION=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "Extracted version: ${VERSION}"
+
+      - name: Build with Maven
+        working-directory: ./app
+        run: mvn clean package -DskipTests -B
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: ./app
+          file: ./app/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.version.outputs.version }}
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to Kubernetes
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    environment: ${{ github.event.inputs.environment || 'staging' }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Fetch and parse Terraform outputs
+        id: parsed-outputs
+        env:
+          TF_API_TOKEN: ${{ secrets.TF_API_TOKEN }}
+          TF_ORG: ${{ env.TF_CLOUD_ORGANIZATION }}
+          TF_WORKSPACE: ${{ env.TF_WORKSPACE }}
+        run: |
+          set -euo pipefail
+
+          # Get workspace ID
+          WORKSPACE_ID=$(curl -sf \
+            --header "Authorization: Bearer ${TF_API_TOKEN}" \
+            --header "Content-Type: application/vnd.api+json" \
+            "https://app.terraform.io/api/v2/organizations/${TF_ORG}/workspaces/${TF_WORKSPACE}" \
+            | jq -r '.data.id')
+
+          # Get current state version
+          STATE_VERSION_ID=$(curl -sf \
+            --header "Authorization: Bearer ${TF_API_TOKEN}" \
+            --header "Content-Type: application/vnd.api+json" \
+            "https://app.terraform.io/api/v2/workspaces/${WORKSPACE_ID}/current-state-version" \
+            | jq -r '.data.id')
+
+          # Get outputs from state version
+          OUTPUTS=$(curl -sf \
+            --header "Authorization: Bearer ${TF_API_TOKEN}" \
+            --header "Content-Type: application/vnd.api+json" \
+            "https://app.terraform.io/api/v2/state-versions/${STATE_VERSION_ID}/outputs?page%5Bsize%5D=100")
+
+          # Helper function to extract value by output name
+          get_output() {
+            echo "$OUTPUTS" | jq -r --arg name "$1" '.data[] | select(.attributes.name == $name) | .attributes.value // empty'
+          }
+
+          # Extract and export outputs
+          echo "DB_URL=$(get_output 'execution_service_jdbc_url')" >> $GITHUB_OUTPUT
+          echo "IRSA_ROLE_ARN=$(get_output 'execution_service_irsa_role_arn')" >> $GITHUB_OUTPUT
+          echo "SQS_EXECUTION_EVENTS=$(get_output 'sqs_execution_events_queue_url')" >> $GITHUB_OUTPUT
+          echo "SQS_EXECUTION_COMPLETED=$(get_output 'sqs_execution_completed_queue_url')" >> $GITHUB_OUTPUT
+          echo "SQS_RESOURCE_UNAVAILABLE=$(get_output 'sqs_resource_unavailable_queue_url')" >> $GITHUB_OUTPUT
+          echo "SQS_BILLING_EVENTS=$(get_output 'sqs_billing_events_queue_url')" >> $GITHUB_OUTPUT
+          echo "SQS_OS_EVENTS=$(get_output 'sqs_os_events_queue_url')" >> $GITHUB_OUTPUT
+
+      - name: Update kubeconfig for EKS
+        run: |
+          aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+
+      - name: Prepare Kubernetes manifests
+        env:
+          DB_URL: ${{ steps.parsed-outputs.outputs.DB_URL }}
+          DB_USERNAME: ${{ secrets.DB_USERNAME }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          SQS_EXECUTION_EVENTS: ${{ steps.parsed-outputs.outputs.SQS_EXECUTION_EVENTS }}
+          SQS_EXECUTION_COMPLETED: ${{ steps.parsed-outputs.outputs.SQS_EXECUTION_COMPLETED }}
+          SQS_RESOURCE_UNAVAILABLE: ${{ steps.parsed-outputs.outputs.SQS_RESOURCE_UNAVAILABLE }}
+          SQS_BILLING_EVENTS: ${{ steps.parsed-outputs.outputs.SQS_BILLING_EVENTS }}
+          SQS_OS_EVENTS: ${{ steps.parsed-outputs.outputs.SQS_OS_EVENTS }}
+          IRSA_ROLE_ARN: ${{ steps.parsed-outputs.outputs.IRSA_ROLE_ARN }}
+          IMAGE_URI: ${{ needs.build-and-push.outputs.image-uri }}
+        run: |
+          set -euo pipefail
+
+          # Substitute values in secrets.yaml using sed
+          sed -i "s|__DB_URL_B64__|$(echo -n "${DB_URL}" | base64 -w0)|g" k8s/secrets.yaml
+          sed -i "s|__DB_USERNAME_B64__|$(echo -n "${DB_USERNAME}" | base64 -w0)|g" k8s/secrets.yaml
+          sed -i "s|__DB_PASSWORD_B64__|$(echo -n "${DB_PASSWORD}" | base64 -w0)|g" k8s/secrets.yaml
+          sed -i "s|__SQS_EXECUTION_EVENTS_QUEUE_URL_B64__|$(echo -n "${SQS_EXECUTION_EVENTS}" | base64 -w0)|g" k8s/secrets.yaml
+
+          # Substitute values in configmap.yaml
+          sed -i "s|__SQS_EXECUTION_COMPLETED_QUEUE_URL__|${SQS_EXECUTION_COMPLETED}|g" k8s/configmap.yaml
+          sed -i "s|__SQS_RESOURCE_UNAVAILABLE_QUEUE_URL__|${SQS_RESOURCE_UNAVAILABLE}|g" k8s/configmap.yaml
+          sed -i "s|__SQS_BILLING_EVENTS_QUEUE__|${SQS_BILLING_EVENTS}|g" k8s/configmap.yaml
+          sed -i "s|__SQS_OS_EVENTS_QUEUE__|${SQS_OS_EVENTS}|g" k8s/configmap.yaml
+
+          # Substitute values in service-account.yaml
+          sed -i "s|__IRSA_ROLE_ARN__|${IRSA_ROLE_ARN}|g" k8s/service-account.yaml
+
+          # Substitute image in deployment
+          sed -i "s|__IMAGE_URI__|${IMAGE_URI}|g" k8s/app-deployment.yaml
+
+          echo "Kubernetes manifests prepared successfully"
+
+      - name: Deploy to Kubernetes
+        run: |
+          # Apply all resources
+          kubectl apply -f k8s/namespace.yaml
+          kubectl apply -f k8s/service-account.yaml
+          kubectl apply -f k8s/configmap.yaml
+          kubectl apply -f k8s/secrets.yaml
+          kubectl apply -f k8s/app-deployment.yaml
+          kubectl apply -f k8s/app-service.yaml
+          kubectl apply -f k8s/hpa.yaml
+
+          # Wait for rollout
+          kubectl rollout status deployment/execution-service -n execution-service --timeout=300s
+
+      - name: Get deployment info
+        id: deployment-info
+        run: |
+          # Get LoadBalancer external IP/hostname
+          EXTERNAL_HOST=$(kubectl get svc execution-service -n execution-service -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+          if [[ -z "$EXTERNAL_HOST" ]]; then
+            EXTERNAL_HOST=$(kubectl get svc execution-service -n execution-service -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "pending")
+          fi
+          echo "external-host=${EXTERNAL_HOST}" >> $GITHUB_OUTPUT
+
+          # Get pod status
+          READY_PODS=$(kubectl get pods -n execution-service -l app=execution-service --no-headers | grep -c Running || echo "0")
+          TOTAL_PODS=$(kubectl get pods -n execution-service -l app=execution-service --no-headers | wc -l)
+          echo "pods=${READY_PODS}/${TOTAL_PODS}" >> $GITHUB_OUTPUT
+
+      - name: Generate deployment summary
+        if: success()
+        env:
+          IMAGE_URI: ${{ needs.build-and-push.outputs.image-uri }}
+          IMAGE_TAG: ${{ needs.build-and-push.outputs.image-tag }}
+          EXTERNAL_HOST: ${{ steps.deployment-info.outputs.external-host }}
+          PODS: ${{ steps.deployment-info.outputs.pods }}
+        run: |
+          BASE_URL="http://${EXTERNAL_HOST}:8080/api/execution-service"
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## 🚀 Deployment Summary
+
+          | Metric | Value |
+          |--------|-------|
+          | **Environment** | \`${{ github.event.inputs.environment || 'staging' }}\` |
+          | **Image** | \`${IMAGE_TAG}\` |
+          | **Pods Ready** | ${PODS} |
+          | **Cluster** | \`${{ env.EKS_CLUSTER_NAME }}\` |
+          | **Namespace** | \`execution-service\` |
+
+          ### 🔗 API Access
+
+          | Endpoint | URL |
+          |----------|-----|
+          | **Base URL** | \`${BASE_URL}\` |
+          | **Swagger UI** | [Open Swagger](${BASE_URL}/swagger-ui/index.html) |
+          | **OpenAPI Spec** | [Download JSON](${BASE_URL}/v3/api-docs) |
+          | **Health Check** | \`${BASE_URL}/actuator/health\` |
+
+          ### 📋 Quick Test Commands
+
+          \`\`\`bash
+          # Health check
+          curl -s ${BASE_URL}/actuator/health | jq .
+
+          # List execution tasks
+          curl -s ${BASE_URL}/v1/execution-tasks | jq .
+
+          # Get execution task by ID
+          curl -s ${BASE_URL}/v1/execution-tasks/1 | jq .
+          \`\`\`
+
+          ---
+          *Deployed at $(date -u '+%Y-%m-%d %H:%M:%S UTC') by @${{ github.actor }}*
+          EOF
+
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          kubectl rollout undo deployment/execution-service -n execution-service || true
+          echo "Deployment failed, attempted rollback to previous version"
