@@ -37,8 +37,8 @@ Configure os seguintes **secrets** no repositório GitHub:
 ```yaml
 env:
   AWS_REGION: us-east-1
-  ECR_REPOSITORY: cargarage-execution-service
-  EKS_CLUSTER_NAME: cargarage-cluster
+  ECR_REPOSITORY: cargarage-app
+  EKS_CLUSTER_NAME: cargarage-eks-prod
   TF_CLOUD_ORGANIZATION: fiap-soat-techchallenge
   TF_WORKSPACE: fiap-techchallenge-infra-database
 ```
