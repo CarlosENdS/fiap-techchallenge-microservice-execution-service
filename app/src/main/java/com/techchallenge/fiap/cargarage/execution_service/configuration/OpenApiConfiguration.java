@@ -24,6 +24,9 @@ public class OpenApiConfiguration {
     @Value("${app.swagger.server-url:}")
     private String serverUrl;
 
+    @Value("${server.servlet.context-path:/api/execution-service}")
+    private String contextPath;
+
     @Bean
     public OpenAPI customOpenAPI() {
         Server server = new Server();
@@ -31,7 +34,8 @@ public class OpenApiConfiguration {
         if (serverUrl != null && !serverUrl.isBlank()) {
             server.url(serverUrl).description("API Server");
         } else {
-            server.url("").description("Current Server");
+            // Use the context-path so Swagger UI sends requests to the correct base
+            server.url(contextPath).description("Current Server");
         }
 
         return new OpenAPI()
