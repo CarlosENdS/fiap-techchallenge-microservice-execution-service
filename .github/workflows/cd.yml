@@ -131,9 +131,15 @@ jobs:
             --header "Content-Type: application/vnd.api+json" \
             "https://app.terraform.io/api/v2/state-versions/${STATE_VERSION_ID}/outputs?page%5Bsize%5D=100")
 
-          # Helper function to extract value by output name
+          # Helper function to extract value by output name (fails fast if output missing)
           get_output() {
-            echo "$OUTPUTS" | jq -r --arg name "$1" '.data[] | select(.attributes.name == $name) | .attributes.value // empty'
+            local val
+            val=$(echo "$OUTPUTS" | jq -r --arg name "$1" '.data[] | select(.attributes.name == $name) | .attributes.value // empty')
+            if [[ -z "$val" ]]; then
+              echo "::error::Terraform output '$1' not found in state. Run terraform apply on infra-database first."
+              exit 1
+            fi
+            echo "$val"
           }
 
           # Extract and export outputs
