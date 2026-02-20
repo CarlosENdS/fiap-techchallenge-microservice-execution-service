@@ -1,0 +1,212 @@
+###############################################################################
+# docker-compose.e2e.yaml
+#
+# Sobe TODA a infraestrutura necessária para rodar os 3 microserviços
+# (OS Service, Billing Service, Execution Service) localmente para testes
+# fim a fim (E2E).
+#
+# Uso:
+#   docker-compose -f docker-compose.e2e.yaml up -d --build
+#   docker-compose -f docker-compose.e2e.yaml logs -f
+#   docker-compose -f docker-compose.e2e.yaml down -v
+#
+# Pré-requisito: todos os repos devem estar lado a lado na mesma pasta pai:
+#   fase4/
+#   ├── fiap-techchallenge-microservice-os-service/
+#   ├── fiap-techchallenge-billing-service/
+#   └── fiap-techchallenge-microservice-execution-service/
+###############################################################################
+version: '3.8'
+
+services:
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # INFRAESTRUTURA COMPARTILHADA
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  localstack:
+    image: localstack/localstack:3.4
+    container_name: e2e-localstack
+    ports:
+      - "4566:4566"
+    environment:
+      - SERVICES=sqs,dynamodb
+      - DEBUG=0
+      - AWS_DEFAULT_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+    volumes:
+      - localstack-data:/var/lib/localstack
+      - ./e2e/init-localstack.sh:/etc/localstack/init/ready.d/init-localstack.sh
+    networks:
+      - e2e-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  os-db:
+    image: postgres:16-alpine
+    container_name: e2e-os-db
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_DB: os_service_db
+      POSTGRES_USER: os_service_user
+      POSTGRES_PASSWORD: os_service_password
+    volumes:
+      - os-db-data:/var/lib/postgresql/data
+      - ../fiap-techchallenge-microservice-os-service/database/init-scripts:/docker-entrypoint-initdb.d
+    networks:
+      - e2e-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U os_service_user -d os_service_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  execution-db:
+    image: postgres:16-alpine
+    container_name: e2e-execution-db
+    ports:
+      - "5434:5432"
+    environment:
+      POSTGRES_DB: execution_service_db
+      POSTGRES_USER: execution_service_user
+      POSTGRES_PASSWORD: execution_service_password
+    volumes:
+      - execution-db-data:/var/lib/postgresql/data
+      - ./database/init-scripts:/docker-entrypoint-initdb.d
+    networks:
+      - e2e-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U execution_service_user -d execution_service_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # MICROSERVIÇOS
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  os-service:
+    build:
+      context: ../fiap-techchallenge-microservice-os-service/app
+      dockerfile: Dockerfile
+    container_name: e2e-os-service
+    ports:
+      - "8080:8080"
+    environment:
+      SPRING_PROFILES_ACTIVE: local
+      DB_URL: jdbc:postgresql://os-db:5432/os_service_db
+      DB_USERNAME: os_service_user
+      DB_PASSWORD: os_service_password
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_SQS_ENDPOINT: http://localstack:4566
+      # Filas SQS (URLs internas do container)
+      SQS_OS_EVENTS_QUEUE_URL: http://localstack:4566/000000000000/os-order-events-queue.fifo
+      SQS_QUOTE_APPROVED_QUEUE: quote-approved-queue
+      SQS_EXECUTION_COMPLETED_QUEUE: execution-completed-queue
+      SQS_PAYMENT_FAILED_QUEUE: payment-failed-queue
+      SQS_RESOURCE_UNAVAILABLE_QUEUE: resource-unavailable-queue
+      # Fila para notificar billing service (OS → Billing)
+      SQS_BILLING_ORDER_EVENTS_URL: http://localstack:4566/000000000000/service-order-events
+    depends_on:
+      os-db:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    networks:
+      - e2e-network
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/api/os-service/actuator/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+
+  billing-service:
+    build:
+      context: ../fiap-techchallenge-billing-service
+      dockerfile: Dockerfile
+    container_name: e2e-billing-service
+    ports:
+      - "8081:8080"
+    environment:
+      SPRING_PROFILES_ACTIVE: local
+      SERVER_PORT: "8080"
+      SERVER_SERVLET_CONTEXT_PATH: /api/v1
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      # Sobrescreve endpoint para apontar pro localstack compartilhado
+      # (billing-service usa @Value("${aws.endpoint:}") na AwsConfig)
+      AWS_ENDPOINT: http://localstack:4566
+      # Filas SQS do billing com nomes corretos (FIFO e standard)
+      AWS_SQS_QUEUES_SERVICE_ORDER_EVENTS: service-order-events
+      AWS_SQS_QUEUES_BILLING_EVENTS: billing-events.fifo
+      AWS_SQS_QUEUES_QUOTE_APPROVED_QUEUE: quote-approved-queue
+      AWS_SQS_QUEUES_PAYMENT_FAILED_QUEUE: payment-failed-queue
+      # Desabilita OAuth2 JWT para testes locais (caso nao tenha auth server)
+      SPRING_SECURITY_OAUTH2_RESOURCESERVER_JWT_ISSUER_URI: ""
+    depends_on:
+      localstack:
+        condition: service_healthy
+    networks:
+      - e2e-network
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/api/v1/actuator/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+
+  execution-service:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    container_name: e2e-execution-service
+    ports:
+      - "8082:8080"
+    environment:
+      SPRING_PROFILES_ACTIVE: local
+      DB_URL: jdbc:postgresql://execution-db:5432/execution_service_db
+      DB_USERNAME: execution_service_user
+      DB_PASSWORD: execution_service_password
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_SQS_ENDPOINT: http://localstack:4566
+      # Filas de publicação (URLs internas)
+      SQS_EXECUTION_EVENTS_QUEUE_URL: http://localstack:4566/000000000000/execution-service-events.fifo
+      SQS_EXECUTION_COMPLETED_QUEUE_URL: http://localstack:4566/000000000000/execution-completed-queue
+      SQS_RESOURCE_UNAVAILABLE_QUEUE_URL: http://localstack:4566/000000000000/resource-unavailable-queue
+      # Filas de consumo
+      SQS_BILLING_EVENTS_QUEUE: billing-events.fifo
+      SQS_OS_EVENTS_QUEUE: os-order-events-queue.fifo
+    depends_on:
+      execution-db:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    networks:
+      - e2e-network
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/api/execution-service/actuator/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+
+networks:
+  e2e-network:
+    name: cargarage-e2e
+    driver: bridge
+
+volumes:
+  localstack-data:
+  os-db-data:
+  execution-db-data:
